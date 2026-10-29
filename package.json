@@ -1,0 +1,41 @@
+{
+  "name": "pi-skills",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Evidence-based procedural skill lifecycle for Pi",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "files": [
+    "src",
+    "THIRD_PARTY_NOTICES"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "test:unit": "node --test tests/lifecycle.test.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome lint .",
+    "format": "biome format --write .",
+    "format:check": "biome format ."
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "typebox": "^1.3.27"
+  },
+  "overrides": {
+    "undici": "^8.12.3"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@types/node": "^22.0.0",
+    "@biomejs/biome": "^2.0.0",
+    "typescript": "^6.0.3",
+    "typebox": "1.3.27"
+  }
+}

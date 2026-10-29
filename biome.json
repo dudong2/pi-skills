@@ -1,0 +1,15 @@
+{
+  "files": {
+    "includes": ["src/**", "tests/**", "*.json"]
+  },
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended"
+    }
+  }
+}
