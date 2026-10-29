@@ -8,6 +8,7 @@ import {
   activate,
   assertSafe,
   CandidateSchema,
+  CaptureSchema,
   consider,
   DocumentSchema,
   documentHash,
@@ -25,12 +26,30 @@ import {
   type SkillDocument,
   type Validation,
 } from "./lifecycle.ts";
+import {
+  assertFresh,
+  canPromote,
+  checkTask,
+  expired,
+  initializeLearning,
+  learningOf,
+  LearningSchema,
+  recordApplication,
+  renderCandidate,
+  sameTask,
+  TaskSchema,
+  validTime,
+  type TaskIdentity,
+  type UseEvidence,
+} from "./learning.ts";
+import { searchSkills } from "./search.ts";
 
 export const METADATA_FILE = ".pi-skills.json";
 const StoredSkill = Type.Object({
   id: Type.String(),
   generation: Type.String({ minLength: 1 }),
   candidate: CandidateSchema,
+  learning: Type.Optional(LearningSchema),
   adoption: Type.Optional(
     Type.Object(
       {
@@ -55,6 +74,7 @@ const StoredSkill = Type.Object({
       document: DocumentSchema,
       hash: Type.String(),
       invalidatedAt: Type.Optional(Type.String()),
+      task: Type.Optional(TaskSchema),
       validation: Type.Optional(
         Type.Object(
           {
@@ -79,27 +99,30 @@ const StoredSkill = Type.Object({
   ),
 });
 const CatalogSchema = Type.Object({
-  version: Type.Literal(2),
+  version: Type.Union([Type.Literal(2), Type.Literal(3)]),
   managedBy: Type.Literal("pi-skills"),
   skills: Type.Array(StoredSkill),
+  legacyImports: Type.Optional(Type.Array(Type.String())),
 });
 const LegacySchema = Type.Object({
   version: Type.Literal(1),
   skills: Type.Array(Type.Omit(StoredSkill, ["generation"])),
 });
 interface Catalog {
-  version: 2;
+  version: 3;
   managedBy: "pi-skills";
   skills: Skill[];
+  legacyImports?: string[];
 }
 interface ScopeCatalog {
   root: string;
   scope: "global" | "project";
   catalog: Catalog;
+  needsUpgrade: boolean;
 }
 const queues = new Map<string, Promise<unknown>>();
 const empty = (): Catalog => ({
-  version: 2,
+  version: 3,
   managedBy: "pi-skills",
   skills: [],
 });
@@ -168,6 +191,38 @@ async function atomicWrite(
   }
 }
 function checkSkill(skill: Skill, scope: ScopeCatalog["scope"]): void {
+  initializeLearning(skill, new Date().toISOString());
+  const learning = learningOf(skill);
+  validTime(learning.createdAt);
+  validTime(learning.captureTask.startedAt);
+  if (learning.lastAppliedAt) validTime(learning.lastAppliedAt);
+  for (const use of learning.uses) {
+    const source = skill.revisions[use.sourceRevision - 1];
+    const target = skill.revisions[use.revision - 1];
+    if (
+      !source ||
+      !target ||
+      source.hash !== use.sourceHash ||
+      target.hash !== use.hash ||
+      use.reusedSteps.some((step) => step > source.document.steps.length) ||
+      new Set(use.reusedSteps).size !== use.reusedSteps.length ||
+      sameTask(use.task, learning.captureTask) ||
+      sameTask(use.task, source.task ?? learning.captureTask) ||
+      validTime(use.task.startedAt) < validTime(learning.createdAt)
+    )
+      throw new Error("Invalid actual-application provenance in metadata.");
+    checkTask(use.task, use.at);
+    validTime(use.at);
+  }
+  if (
+    (learning.uses.length === 0) !== (learning.lastAppliedAt === undefined) ||
+    (learning.lastAppliedAt !== undefined &&
+      validTime(learning.lastAppliedAt) !==
+        Math.max(...learning.uses.map((use) => validTime(use.at))))
+  )
+    throw new Error(
+      "Candidate renewal timestamp does not match actual-application evidence.",
+    );
   if (skill.id !== skillId(skill.candidate) || skill.candidate.scope !== scope)
     throw new Error("Invalid skill identity in metadata.");
   assertSafe(skill);
@@ -211,8 +266,20 @@ function checkSkill(skill: Skill, scope: ScopeCatalog["scope"]): void {
 
 export class SkillStore {
   readonly root: string;
-  constructor(agentDir: string) {
+  private readonly clock: () => Date;
+  constructor(agentDir: string, clock: () => Date = () => new Date()) {
     this.root = path.resolve(agentDir);
+    this.clock = clock;
+  }
+  private now(): string {
+    return this.clock().toISOString();
+  }
+  candidatePath(skill: Skill, project: string): string {
+    return path.join(
+      this.scopeRoot(project, skill.candidate.scope),
+      skill.candidate.name,
+      "candidate.json",
+    );
   }
   scopeRoot(project: string, scope: "global" | "project"): string {
     return scope === "global"
@@ -242,18 +309,24 @@ export class SkillStore {
       const file = this.catalogPath(project, scope);
       const data = await readText(file);
       let catalog = empty();
+      let needsUpgrade = false;
       if (data !== null) {
-        catalog = decode(data, file, CatalogSchema) as Catalog;
+        const decoded = decode(data, file, CatalogSchema);
+        needsUpgrade =
+          decoded.version !== 3 ||
+          decoded.skills.some((skill) => !skill.learning);
+        catalog = { ...decoded, version: 3 } as Catalog;
       }
       const ids = new Set<string>();
       for (const skill of catalog.skills) {
+        initializeLearning(skill, this.now());
         checkSkill(skill, scope);
         if (scope === "project") skill.projectRoot = project;
         if (ids.has(skill.id))
           throw new Error("Duplicate skill identity in metadata.");
         ids.add(skill.id);
       }
-      scopes.push({ root, scope, catalog });
+      scopes.push({ root, scope, catalog, needsUpgrade });
     }
     return scopes;
   }
@@ -300,7 +373,7 @@ export class SkillStore {
           try {
             for (const [i, entry] of scopes.entries()) {
               const contents = JSON.stringify(entry.catalog);
-              if (contents === before[i]) continue;
+              if (contents === before[i] && !entry.needsUpgrade) continue;
               if (Buffer.byteLength(contents) > 5_000_000)
                 throw new Error("Skill metadata exceeds 5 MB.");
               await atomicWrite(
@@ -347,7 +420,28 @@ export class SkillStore {
     const skill = (await this.list(project)).find((s) => s.id === id);
     if (!skill)
       throw new Error("Skill not found in this project/global scope.");
+    assertFresh(skill, this.now());
     return skill;
+  }
+
+  private async checkCandidateProjection(
+    skill: Skill,
+    project: string,
+  ): Promise<string | null> {
+    const contents = await readText(this.candidatePath(skill, project));
+    if (
+      contents !== null &&
+      !skill.revisions.some((revision) => {
+        const copy = structuredClone(skill);
+        learningOf(copy).everActivated = false;
+        copy.status = "draft";
+        return renderCandidate(copy, revision) === contents;
+      })
+    )
+      throw new Error(
+        "Candidate file was manually modified or is unmanaged; preserving it.",
+      );
+    return contents;
   }
 
   private async checkProjection(
@@ -367,14 +461,70 @@ export class SkillStore {
     return contents;
   }
   private async publish(skill: Skill, project: string): Promise<void> {
-    const existing = await this.checkProjection(skill, project);
     const file = this.skillPath(skill, project);
-    const contents = publishedContent(skill);
-    if (contents === null) {
-      if (existing !== null) await fs.unlink(file);
-      return;
+    const candidateFile = this.candidatePath(skill, project);
+    const plan = [
+      {
+        path: file,
+        before: await this.checkProjection(skill, project),
+        after: publishedContent(skill),
+        mode: 0o600,
+      },
+      {
+        path: candidateFile,
+        before: await this.checkCandidateProjection(skill, project),
+        after: renderCandidate(skill),
+        mode: 0o600,
+      },
+    ];
+    for (const item of plan)
+      if (item.before !== null)
+        item.mode = (await fs.stat(item.path)).mode & 0o777;
+    const newDirectories = new Set<string>();
+    for (const item of plan) {
+      if (item.after === null) continue;
+      const folder = path.dirname(item.path);
+      try {
+        await fs.lstat(folder);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        newDirectories.add(folder);
+      }
     }
-    if (contents !== existing) await atomicWrite(file, contents);
+    const applied: typeof plan = [];
+    try {
+      for (const item of plan) {
+        if (item.before === item.after) continue;
+        if (item.after === null) await fs.unlink(item.path);
+        else await atomicWrite(item.path, item.after, item.mode);
+        applied.push(item);
+      }
+    } catch (error) {
+      try {
+        for (const item of applied.toReversed()) {
+          if (item.before === null) await fs.unlink(item.path);
+          else await atomicWrite(item.path, item.before, item.mode);
+        }
+        for (const folder of newDirectories) {
+          try {
+            await fs.rmdir(folder);
+          } catch (cleanupError) {
+            if (
+              !["ENOENT", "ENOTEMPTY", "EEXIST"].includes(
+                (cleanupError as NodeJS.ErrnoException).code ?? "",
+              )
+            )
+              throw cleanupError;
+          }
+        }
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "Skill projection rollback failed; publication was not successful.",
+        );
+      }
+      throw error;
+    }
   }
 
   private async assertUnclaimed(skill: Skill, project: string): Promise<void> {
@@ -633,8 +783,62 @@ export class SkillStore {
     return this.repairNativeReferences(moved.skill.id, project);
   }
 
-  async consider(candidate: Candidate, project: string): Promise<Skill> {
-    const skill = consider(candidate, project);
+  async capture(
+    candidate: Candidate,
+    project: string,
+    document: SkillDocument,
+    task?: TaskIdentity,
+  ): Promise<Skill> {
+    if (!Value.Check(CaptureSchema, candidate))
+      throw new Error(
+        "Capture requires an upstream trigger and procedural evidence, not future reuse predictions.",
+      );
+    const skill = draft(
+      consider(candidate, project, task, this.now()),
+      document,
+      task,
+      this.now(),
+    );
+    return this.mutate(
+      project,
+      async (scopes) => {
+        const entry = scopes.find((s) => s.scope === candidate.scope);
+        if (!entry) throw new Error("Unknown scope.");
+        if (entry.catalog.skills.some((s) => s.id === skill.id))
+          throw new Error("Candidate already exists; revise it instead.");
+        await this.assertUnclaimed(skill, project);
+        entry.catalog.skills.push(skill);
+        return skill;
+      },
+      (created) => this.publish(created, project),
+    );
+  }
+
+  async search(
+    project: string,
+    query: string,
+    limit = 10,
+    candidatesOnly = false,
+  ) {
+    return searchSkills(
+      await this.list(project),
+      query,
+      this.now(),
+      limit,
+      candidatesOnly,
+    );
+  }
+
+  async consider(
+    candidate: Candidate,
+    project: string,
+    task?: TaskIdentity,
+  ): Promise<Skill> {
+    if (!Value.Check(CaptureSchema, candidate))
+      throw new Error(
+        "Candidate capture requires an upstream trigger and procedural evidence.",
+      );
+    const skill = consider(candidate, project, task, this.now());
     return this.mutate(project, async (scopes) => {
       const entry = scopes.find((s) => s.scope === candidate.scope);
       if (!entry) throw new Error("Unknown scope.");
@@ -667,7 +871,9 @@ export class SkillStore {
         if (!entry || index < 0)
           throw new Error("Skill not found in this project/global scope.");
         const skill = entry.catalog.skills[index];
+        assertFresh(skill, this.now());
         await this.checkProjection(skill, project);
+        await this.checkCandidateProjection(skill, project);
         const updated = await update(skill, scopes);
         entry.catalog.skills[index] = updated;
         return updated;
@@ -680,9 +886,48 @@ export class SkillStore {
     id: string,
     project: string,
     document: SkillDocument,
+    task?: TaskIdentity,
   ): Promise<Skill> {
-    return this.change(id, project, (skill) => draft(skill, document));
+    return this.change(id, project, (skill) =>
+      draft(skill, document, task, this.now()),
+    );
   }
+  private async publishIfEligible(
+    skill: Skill,
+    scopes: ScopeCatalog[],
+    externalNames: string[],
+  ): Promise<Skill> {
+    if (!canPromote(skill)) return skill;
+    const id = skill.id;
+    if (
+      externalNames.includes(skill.candidate.name) ||
+      scopes.some((s) =>
+        s.catalog.skills.some(
+          (other) =>
+            other.id !== id &&
+            other.status === "active" &&
+            other.candidate.name === skill.candidate.name,
+        ),
+      )
+    )
+      throw new Error(
+        "An active or external skill already uses this name; choose a distinct name.",
+      );
+    for (const entry of scopes) {
+      if (entry.scope === skill.candidate.scope) continue;
+      for (const target of [
+        path.join(entry.root, skill.candidate.name, "SKILL.md"),
+        path.join(entry.root, `${skill.candidate.name}.md`),
+      ]) {
+        if ((await readText(target)) !== null)
+          throw new Error(
+            `An existing skill already uses this name: ${target}`,
+          );
+      }
+    }
+    return activate(skill);
+  }
+
   async validate(
     id: string,
     project: string,
@@ -690,37 +935,128 @@ export class SkillStore {
     sessionId: string,
     externalNames: string[] = [],
   ): Promise<Skill> {
-    return this.change(id, project, async (skill, scopes) => {
-      const checked = validate(skill, evidence, sessionId);
-      if (
-        externalNames.includes(skill.candidate.name) ||
-        scopes.some((s) =>
-          s.catalog.skills.some(
-            (other) =>
-              other.id !== id &&
-              other.status === "active" &&
-              other.candidate.name === skill.candidate.name,
-          ),
-        )
-      )
-        throw new Error(
-          "An active or external skill already uses this name; choose a distinct name.",
-        );
-      for (const entry of scopes) {
-        if (entry.scope === skill.candidate.scope) continue;
-        for (const target of [
-          path.join(entry.root, skill.candidate.name, "SKILL.md"),
-          path.join(entry.root, `${skill.candidate.name}.md`),
-        ]) {
-          if ((await readText(target)) !== null)
-            throw new Error(
-              `An existing skill already uses this name: ${target}`,
-            );
-        }
-      }
-      return activate(checked);
-    });
+    return this.change(id, project, (skill, scopes) =>
+      this.publishIfEligible(
+        validate(skill, evidence, sessionId, this.now()),
+        scopes,
+        externalNames,
+      ),
+    );
   }
+  async recordUse(
+    id: string,
+    project: string,
+    evidence: UseEvidence,
+    task: TaskIdentity,
+    externalNames: string[] = [],
+  ): Promise<Skill> {
+    assertSafe(evidence);
+    return this.change(id, project, (skill, scopes) =>
+      this.publishIfEligible(
+        recordApplication(skill, evidence, task, this.now()),
+        scopes,
+        externalNames,
+      ),
+    );
+  }
+
+  async maintain(project: string): Promise<{
+    deleted: string[];
+    protected: { id: string; reason: string }[];
+  }> {
+    const existing = await this.load(project);
+    if (
+      !existing.some(
+        (entry) =>
+          entry.needsUpgrade ||
+          entry.catalog.skills.some((skill) => expired(skill, this.now())),
+      )
+    )
+      return { deleted: [], protected: [] };
+    const result = await this.mutate(
+      project,
+      async (scopes) => {
+        const deleted: string[] = [];
+        const protectedFiles: { id: string; reason: string }[] = [];
+        const files: { path: string; contents: string; mode: number }[] = [];
+        const folders: string[] = [];
+        for (const entry of scopes) {
+          const keep: Skill[] = [];
+          for (const skill of entry.catalog.skills) {
+            if (!expired(skill, this.now())) {
+              keep.push(skill);
+              continue;
+            }
+            try {
+              if ((await readText(this.skillPath(skill, project))) !== null)
+                throw new Error(
+                  "A published or external SKILL.md exists; preserving it.",
+                );
+              const contents = await this.checkCandidateProjection(
+                skill,
+                project,
+              );
+              const file = this.candidatePath(skill, project);
+              if (contents !== null)
+                files.push({
+                  path: file,
+                  contents,
+                  mode: (await fs.stat(file)).mode & 0o777,
+                });
+              folders.push(path.dirname(file));
+              deleted.push(skill.id);
+            } catch (error) {
+              keep.push(skill);
+              protectedFiles.push({
+                id: skill.id,
+                reason: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+          entry.catalog.skills = keep;
+        }
+        return { deleted, protected: protectedFiles, files, folders };
+      },
+      async (plan) => {
+        const removed: typeof plan.files = [];
+        try {
+          for (const file of plan.files) {
+            if ((await readText(file.path)) !== file.contents)
+              throw new Error(
+                "Candidate changed during expiration; preserving it.",
+              );
+            await fs.unlink(file.path);
+            removed.push(file);
+          }
+        } catch (error) {
+          try {
+            for (const file of removed.toReversed())
+              await atomicWrite(file.path, file.contents, file.mode);
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [error, rollbackError],
+              "Candidate cleanup failed and deleted-file restoration could not complete.",
+            );
+          }
+          throw error;
+        }
+      },
+    );
+    for (const folder of result.folders) {
+      try {
+        await fs.rmdir(folder);
+      } catch (error) {
+        if (
+          !["ENOENT", "ENOTEMPTY", "EEXIST"].includes(
+            (error as NodeJS.ErrnoException).code ?? "",
+          )
+        )
+          throw error;
+      }
+    }
+    return { deleted: result.deleted, protected: result.protected };
+  }
+
   async retire(
     id: string,
     project: string,
@@ -758,7 +1094,6 @@ export class SkillStore {
     for (const old of legacy.skills) {
       if (old.projectRoot !== null && old.projectRoot !== project) continue;
       const id = skillId(old.candidate);
-      if ((await this.list(project)).some((s) => s.id === id)) continue;
       const imported: Skill = {
         ...old,
         id,
@@ -778,7 +1113,14 @@ export class SkillStore {
           const entry = scopes.find(
             (s) => s.scope === imported.candidate.scope,
           );
-          if (!entry || entry.catalog.skills.some((s) => s.id === id))
+          if (!entry) return null;
+          entry.catalog.legacyImports ??= [];
+          if (entry.catalog.legacyImports.includes(old.id)) return null;
+          entry.catalog.legacyImports.push(old.id);
+          if (
+            entry.catalog.skills.some((s) => s.id === id) ||
+            expired(imported, this.now())
+          )
             return null;
           await this.assertUnclaimed(imported, project);
           entry.catalog.skills.push(imported);

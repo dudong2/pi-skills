@@ -11,7 +11,13 @@ import {
   type ResourcesDiscoverResult,
 } from "@earendil-works/pi-coding-agent";
 import { SkillStore } from "../src/store.ts";
-import { candidate, document, validation } from "./fixtures.ts";
+import {
+  candidate,
+  document,
+  validation,
+  useEvidence,
+  nextTask,
+} from "./fixtures.ts";
 
 test("Pi's real TypeScript extension loader and skill parser accept the package", async (t) => {
   const temp = await fs.realpath(
@@ -56,6 +62,7 @@ test("Pi's real TypeScript extension loader and skill parser accept the package"
   const skill = await store.consider({ ...candidate, scope: "global" }, temp);
   await store.draft(skill.id, temp, document);
   await store.validate(skill.id, temp, validation, "loader-test");
+  await store.recordUse(skill.id, temp, useEvidence, nextTask());
   const [skillPath] = (await discover()).skillPaths ?? [];
   assert.ok(skillPath);
   const loaded = loadSkillsFromDir({

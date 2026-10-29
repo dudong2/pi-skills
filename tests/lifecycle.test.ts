@@ -9,14 +9,9 @@ import {
   retire,
   validate,
 } from "../src/lifecycle.ts";
-import { candidate, document, validation } from "./fixtures.ts";
+import { candidate, document, validation, reusableSkill } from "./fixtures.ts";
 
-const ready = () =>
-  validate(
-    draft(consider(candidate, "/repo"), document),
-    validation,
-    "session-1",
-  );
+const ready = () => reusableSkill("/repo");
 
 test("candidate requires evidence rather than booleans or blank text", () => {
   assert.throws(() => consider({ ...candidate, reuse: " " }, "/repo"), /Blank/);

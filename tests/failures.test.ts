@@ -5,7 +5,14 @@ import path from "node:path";
 import test from "node:test";
 import { activate, consider, draft, validate } from "../src/lifecycle.ts";
 import { SkillStore } from "../src/store.ts";
-import { candidate, document, validation } from "./fixtures.ts";
+import {
+  candidate,
+  document,
+  validation,
+  useEvidence,
+  nextTask,
+  reusableSkill,
+} from "./fixtures.ts";
 
 async function fixture(t: test.TestContext) {
   const temp = await fs.realpath(
@@ -23,6 +30,7 @@ test("failed publication preserves the old file and can be retried without user 
   const skill = await store.consider(candidate, cwd);
   await store.draft(skill.id, cwd, document);
   await store.validate(skill.id, cwd, validation, "s");
+  await store.recordUse(skill.id, cwd, useEvidence, nextTask());
   const file = store.skillPath(skill, cwd);
   const original = await fs.readFile(file, "utf8");
   await store.draft(skill.id, cwd, {
@@ -56,9 +64,7 @@ test("failed publication preserves the old file and can be retried without user 
 for (const layout of ["directory", "standalone"] as const) {
   test(`legacy migration cannot shadow an existing native ${layout} skill`, async (t) => {
     const { cwd, agent, store } = await fixture(t);
-    const skill = activate(
-      validate(draft(consider(candidate, cwd), document), validation, "legacy"),
-    );
+    const skill = activate(reusableSkill(cwd));
     const { generation: _generation, ...legacy } = skill;
     const source = path.join(agent, "pi-skills", "catalog.json");
     await fs.mkdir(path.dirname(source), { recursive: true });
@@ -82,6 +88,7 @@ test("manually removed skills are not recreated during discovery", async (t) => 
   const skill = await store.consider(candidate, cwd);
   await store.draft(skill.id, cwd, document);
   await store.validate(skill.id, cwd, validation, "s");
+  await store.recordUse(skill.id, cwd, useEvidence, nextTask());
   const file = store.skillPath(skill, cwd);
   await fs.unlink(file);
   assert.deepEqual(await store.discoveryPaths(cwd), []);

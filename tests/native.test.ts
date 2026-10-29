@@ -4,7 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { SkillStore, projectRoot } from "../src/store.ts";
-import { candidate, document, validation } from "./fixtures.ts";
+import {
+  candidate,
+  document,
+  validation,
+  useEvidence,
+  nextTask,
+} from "./fixtures.ts";
 
 async function fixture(t: test.TestContext) {
   const temp = await fs.realpath(
@@ -17,7 +23,7 @@ async function fixture(t: test.TestContext) {
   return { cwd, agent, store: new SkillStore(agent) };
 }
 
-test("passing validation publishes project skills automatically in the session cwd", async (t) => {
+test("verified independent reuse publishes project skills in the session cwd", async (t) => {
   const { cwd, store } = await fixture(t);
   const skill = await store.consider(candidate, cwd);
   assert.equal(skill.id, `project:${candidate.name}`);
@@ -28,7 +34,14 @@ test("passing validation publishes project skills automatically in the session c
     validation,
     "native-test",
   );
-  assert.equal(checked.status, "active");
+  assert.equal(checked.status, "validated");
+  const promoted = await store.recordUse(
+    skill.id,
+    cwd,
+    useEvidence,
+    nextTask(),
+  );
+  assert.equal(promoted.status, "active");
   const file = path.join(cwd, ".pi", "skills", candidate.name, "SKILL.md");
   assert.match(await fs.readFile(file, "utf8"), /pi-skills-generated:/);
   assert.deepEqual(await store.discoveryPaths(cwd), [file]);
@@ -38,6 +51,7 @@ test("global skills use the native agent skills directory", async (t) => {
   const skill = await store.consider({ ...candidate, scope: "global" }, cwd);
   await store.draft(skill.id, cwd, document);
   await store.validate(skill.id, cwd, validation, "native-test");
+  await store.recordUse(skill.id, cwd, useEvidence, nextTask());
   assert.ok(
     await fs.stat(path.join(agent, "skills", candidate.name, "SKILL.md")),
   );

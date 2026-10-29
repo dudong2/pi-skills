@@ -1,8 +1,22 @@
-import type { Candidate, SkillDocument, Validation } from "../src/lifecycle.ts";
+import { randomUUID } from "node:crypto";
+import {
+  consider,
+  draft,
+  validate,
+  type Candidate,
+  type SkillDocument,
+  type Validation,
+} from "../src/lifecycle.ts";
+import {
+  recordApplication,
+  type TaskIdentity,
+  type UseEvidence,
+} from "../src/learning.ts";
 
 export const candidate: Candidate = {
   name: "inspect-native-crash",
   scope: "project",
+  trigger: "non-obvious",
   reuse: "When the same vendor binary crashes in another release.",
   procedure: "Match build IDs, resolve frames and verify source locations.",
   differentiation:
@@ -44,3 +58,28 @@ export const validation: Validation = {
   limitations:
     "Only the fixture toolchain was exercised; other platforms need revalidation.",
 };
+export const useEvidence: UseEvidence = {
+  sourceRevision: 1,
+  reusedSteps: [1],
+  adaptations: [],
+  outcome: "success",
+  evidenceRefs: ["session:followup/result:51"],
+};
+export const nextTask = (): TaskIdentity => ({
+  sessionId: "followup-session",
+  requestId: randomUUID(),
+  startedAt: new Date().toISOString(),
+});
+export function reusableSkill(project: string) {
+  const saved = validate(
+    draft(consider(candidate, project), document),
+    validation,
+    "session-1",
+  );
+  return recordApplication(
+    saved,
+    useEvidence,
+    nextTask(),
+    new Date().toISOString(),
+  );
+}

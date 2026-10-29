@@ -2,6 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { scanContent } from "./content-scanner.ts";
+import {
+  assertFresh,
+  canPromote,
+  checkTask,
+  directTask,
+  learningOf,
+  TriggerSchema,
+  type Learning,
+  type TaskIdentity,
+} from "./learning.ts";
 
 const text = Type.String({ minLength: 1, maxLength: 8000 });
 const texts = Type.Array(text, { minItems: 1, maxItems: 30 });
@@ -13,15 +23,20 @@ export const CandidateSchema = Type.Object(
   {
     name: Name,
     scope: Type.Union([Type.Literal("global"), Type.Literal("project")]),
-    reuse: text,
+    trigger: Type.Optional(TriggerSchema),
+    reuse: Type.Optional(text),
     procedure: text,
-    differentiation: text,
-    benefit: text,
+    differentiation: Type.Optional(text),
+    benefit: Type.Optional(text),
     sourceRefs: texts,
     relatedSkills: Type.Array(Type.Object({ path: text, comparison: text }), {
       maxItems: 30,
     }),
   },
+  { additionalProperties: false },
+);
+export const CaptureSchema = Type.Object(
+  { ...CandidateSchema.properties, trigger: TriggerSchema },
   { additionalProperties: false },
 );
 export const DocumentSchema = Type.Object(
@@ -68,6 +83,7 @@ export interface Revision {
   document: SkillDocument;
   hash: string;
   invalidatedAt?: string;
+  task?: TaskIdentity;
   validation?: Validation & {
     hash: string;
     at: string;
@@ -85,6 +101,7 @@ export interface Adoption {
 export interface Skill {
   id: string;
   adoption?: Adoption;
+  learning?: Learning;
   generation: string;
   candidate: Candidate;
   projectRoot: string | null;
@@ -124,12 +141,20 @@ function event(skill: Skill, kind: string, reason: string): void {
   skill.events.push({ at: new Date().toISOString(), kind, reason });
 }
 
-export function consider(candidate: Candidate, projectRoot: string): Skill {
+export function consider(
+  candidate: Candidate,
+  projectRoot: string,
+  task?: TaskIdentity,
+  now = new Date().toISOString(),
+): Skill {
   if (!Value.Check(CandidateSchema, candidate))
     throw new Error("Invalid candidate evidence.");
   assertSafe(candidate);
+  const captureTask = task ?? directTask(now);
+  checkTask(captureTask, now);
   return {
     id: skillId(candidate),
+    learning: { createdAt: now, captureTask, everActivated: false, uses: [] },
     generation: randomUUID(),
     candidate,
     projectRoot: candidate.scope === "project" ? projectRoot : null,
@@ -146,7 +171,15 @@ export function consider(candidate: Candidate, projectRoot: string): Skill {
   };
 }
 
-export function draft(skill: Skill, document: SkillDocument): Skill {
+export function draft(
+  skill: Skill,
+  document: SkillDocument,
+  task?: TaskIdentity,
+  now = new Date().toISOString(),
+): Skill {
+  assertFresh(skill, now);
+  const revisionTask = task ?? learningOf(skill).captureTask;
+  checkTask(revisionTask, now);
   if (skill.status === "archived")
     throw new Error(
       "Archived skills cannot be edited; create a new candidate.",
@@ -159,6 +192,7 @@ export function draft(skill: Skill, document: SkillDocument): Skill {
     number: next.revisions.length + 1,
     document,
     hash: documentHash(document),
+    task: revisionTask,
   });
   if (next.status !== "active") next.status = "draft";
   event(
@@ -173,7 +207,9 @@ export function validate(
   skill: Skill,
   validation: Validation,
   sessionId: string,
+  now = new Date().toISOString(),
 ): Skill {
+  assertFresh(skill, now);
   if (skill.status === "archived" || skill.revisions.length === 0)
     throw new Error("A non-archived draft is required.");
   if (!Value.Check(ValidationSchema, validation))
@@ -214,13 +250,18 @@ export function activate(skill: Skill): Skill {
       "The latest revision needs matching validation evidence before activation.",
     );
   }
+  if (!canPromote(skill))
+    throw new Error(
+      "A successful independent reuse report is required to promote this candidate.",
+    );
   const next = structuredClone(skill);
+  learningOf(next).everActivated = true;
   next.status = "active";
   next.activeRevision = revision.number;
   event(
     next,
     "activate",
-    "Automatically published this exact revision after passing validation and ownership checks.",
+    "Published this exact revision after validation and independent reuse, or as an update to a previously activated skill.",
   );
   return next;
 }

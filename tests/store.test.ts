@@ -5,7 +5,14 @@ import path from "node:path";
 import test from "node:test";
 import { activate, consider, draft, validate } from "../src/lifecycle.ts";
 import { SkillStore } from "../src/store.ts";
-import { candidate, document, validation } from "./fixtures.ts";
+import {
+  candidate,
+  document,
+  validation,
+  useEvidence,
+  nextTask,
+  reusableSkill,
+} from "./fixtures.ts";
 
 async function fixture(t: test.TestContext) {
   const temp = await fs.realpath(
@@ -20,7 +27,8 @@ async function fixture(t: test.TestContext) {
 async function ready(store: SkillStore, cwd: string) {
   const skill = await store.consider(candidate, cwd);
   await store.draft(skill.id, cwd, document);
-  return store.validate(skill.id, cwd, validation, "session-1");
+  await store.validate(skill.id, cwd, validation, "session-1");
+  return store.recordUse(skill.id, cwd, useEvidence, nextTask());
 }
 
 test("malformed metadata fails closed and remains byte-identical", async (t) => {
@@ -48,6 +56,8 @@ test("only validated versions are published, with no approval or extra activatio
   await store.draft(skill.id, cwd, document);
   assert.deepEqual(await store.discoveryPaths(cwd), []);
   await store.validate(skill.id, cwd, validation, "s");
+  assert.deepEqual(await store.discoveryPaths(cwd), []);
+  await store.recordUse(skill.id, cwd, useEvidence, nextTask());
   const [file] = await store.discoveryPaths(cwd);
   const old = await fs.readFile(file, "utf8");
   await store.draft(skill.id, cwd, {
@@ -227,8 +237,9 @@ test("active and external name collisions prevent automatic publication", async 
   );
   const global = await store.consider({ ...candidate, scope: "global" }, cwd);
   await store.draft(global.id, cwd, document);
+  await store.validate(global.id, cwd, validation, "s");
   await assert.rejects(
-    store.validate(global.id, cwd, validation, "s"),
+    store.recordUse(global.id, cwd, useEvidence, nextTask()),
     /already uses/,
   );
 });
@@ -245,13 +256,7 @@ test("ids cannot escape native skill roots", async (t) => {
 });
 test("legacy v0.1 records migrate once without deleting source data", async (t) => {
   const { agent, cwd, store } = await fixture(t);
-  const original = activate(
-    validate(
-      draft(consider(candidate, cwd), document),
-      validation,
-      "legacy-session",
-    ),
-  );
+  const original = activate(reusableSkill(cwd));
   const { generation: _generation, ...legacySkill } = original;
   const legacyFile = path.join(agent, "pi-skills", "catalog.json");
   const legacyBytes = JSON.stringify({
