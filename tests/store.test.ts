@@ -3,179 +3,269 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { reviewHash } from "../src/lifecycle.ts";
-import { SkillStore, projectRoot } from "../src/store.ts";
+import { activate, consider, draft, validate } from "../src/lifecycle.ts";
+import { SkillStore } from "../src/store.ts";
 import { candidate, document, validation } from "./fixtures.ts";
 
 async function fixture(t: test.TestContext) {
   const temp = await fs.realpath(
-    await fs.mkdtemp(path.join(os.tmpdir(), "pi-skills-test-")),
+    await fs.mkdtemp(path.join(os.tmpdir(), "pi-skills-store-")),
   );
   t.after(() => fs.rm(temp, { recursive: true, force: true }));
-  const root = path.join(temp, "store");
-  return { temp, root, store: new SkillStore(root) };
+  const agent = path.join(temp, "agent");
+  const cwd = path.join(temp, "work");
+  await fs.mkdir(cwd);
+  return { temp, agent, cwd, store: new SkillStore(agent) };
 }
-async function ready(store: SkillStore, project = "/repo") {
-  const skill = await store.consider(candidate, project);
-  await store.draft(skill.id, project, document);
-  return store.validate(skill.id, project, validation, "session-1");
+async function ready(store: SkillStore, cwd: string) {
+  const skill = await store.consider(candidate, cwd);
+  await store.draft(skill.id, cwd, document);
+  return store.validate(skill.id, cwd, validation, "session-1");
 }
 
-test("malformed catalog fails closed and remains byte-identical", async (t) => {
-  const { root, store } = await fixture(t);
-  await fs.mkdir(root);
-  await fs.writeFile(store.catalogPath, "{broken");
+test("malformed metadata fails closed and remains byte-identical", async (t) => {
+  const { cwd, store } = await fixture(t);
+  const file = store.catalogPath(cwd, "project");
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, "{broken");
   await assert.rejects(
-    store.consider(candidate, "/repo"),
-    /Malformed skill catalog.*repair or restore/,
+    store.consider(candidate, cwd),
+    /Malformed skill metadata.*repair or restore/,
   );
-  assert.equal(await fs.readFile(store.catalogPath, "utf8"), "{broken");
+  assert.equal(await fs.readFile(file, "utf8"), "{broken");
 });
-test("validation metadata survives a store reload", async (t) => {
-  const { store, root } = await fixture(t);
-  const skill = await ready(store);
-  assert.equal(
-    (await new SkillStore(root).get(skill.id, "/repo")).revisions[0].validation
-      ?.sessionId,
-    "session-1",
-  );
+test("metadata and ownership survive reload", async (t) => {
+  const { agent, cwd, store } = await fixture(t);
+  const skill = await ready(store, cwd);
+  const reloaded = await new SkillStore(agent).get(skill.id, cwd);
+  assert.equal(reloaded.generation, skill.generation);
+  assert.equal(reloaded.revisions[0].validation?.sessionId, "session-1");
 });
-test("only active revisions are discoverable, including after a pending revision", async (t) => {
-  const { store } = await fixture(t);
-  const initial = await store.consider(candidate, "/repo");
-  assert.deepEqual(await store.discoveryPaths("/repo"), []);
-  await store.draft(initial.id, "/repo", document);
-  assert.deepEqual(await store.discoveryPaths("/repo"), []);
-  const checked = await store.validate(initial.id, "/repo", validation, "s");
-  assert.deepEqual(await store.discoveryPaths("/repo"), []);
-  await store.activate(initial.id, "/repo", reviewHash(checked), []);
-  const [file] = await store.discoveryPaths("/repo");
-  assert.match(await fs.readFile(file, "utf8"), /Compare build IDs/);
-  await store.draft(initial.id, "/repo", {
+test("only validated versions are published, with no approval or extra activation step", async (t) => {
+  const { cwd, store } = await fixture(t);
+  const skill = await store.consider(candidate, cwd);
+  assert.deepEqual(await store.discoveryPaths(cwd), []);
+  await store.draft(skill.id, cwd, document);
+  assert.deepEqual(await store.discoveryPaths(cwd), []);
+  await store.validate(skill.id, cwd, validation, "s");
+  const [file] = await store.discoveryPaths(cwd);
+  const old = await fs.readFile(file, "utf8");
+  await store.draft(skill.id, cwd, {
     ...document,
-    steps: ["New unvalidated step."],
+    steps: ["A revised procedure."],
   });
-  assert.deepEqual(await store.discoveryPaths("/repo"), [file]);
-  assert.doesNotMatch(await fs.readFile(file, "utf8"), /New unvalidated/);
-  await store.retire(
-    initial.id,
-    "/repo",
-    "deprecated",
-    "The environment changed.",
-  );
-  assert.deepEqual(await store.discoveryPaths("/repo"), []);
+  assert.equal(await fs.readFile(file, "utf8"), old);
+  await store.validate(skill.id, cwd, validation, "s");
+  assert.match(await fs.readFile(file, "utf8"), /A revised procedure/);
 });
-test("projects remain isolated while globals are shared", async (t) => {
-  const { store } = await fixture(t);
-  const local = await store.consider(candidate, "/repo-a");
-  await assert.rejects(store.get(local.id, "/repo-b"), /not found/);
-  await assert.rejects(store.draft(local.id, "/repo-b", document), /not found/);
+test("failed validation does not publish or replace the old active file", async (t) => {
+  const { cwd, store } = await fixture(t);
+  const skill = await ready(store, cwd);
+  const file = store.skillPath(skill, cwd);
+  const old = await fs.readFile(file, "utf8");
+  await store.draft(skill.id, cwd, {
+    ...document,
+    steps: ["Unverified procedure."],
+  });
+  const failed = {
+    ...validation,
+    checks: [{ ...validation.checks[0], outcome: "fail" as const }],
+  };
+  await assert.rejects(store.validate(skill.id, cwd, failed, "s"), /must pass/);
+  assert.equal(await fs.readFile(file, "utf8"), old);
+});
+test("project metadata is local, portable, and globals remain shared", async (t) => {
+  const { temp, cwd, store } = await fixture(t);
+  const local = await ready(store, cwd);
+  const other = path.join(temp, "other");
+  await fs.mkdir(other);
+  await assert.rejects(store.get(local.id, other), /not found/);
+  const independent = await store.consider(candidate, other);
+  assert.equal(independent.id, local.id);
+  assert.notEqual(independent.generation, local.generation);
   await store.consider(
-    { ...candidate, scope: "global", name: "shared-workflow" },
-    "/repo-a",
+    { ...candidate, scope: "global", name: "shared-procedure" },
+    cwd,
   );
-  assert.equal((await store.list("/repo-b")).length, 1);
+  assert.equal((await store.list(other)).length, 2);
+  const moved = path.join(temp, "moved");
+  await fs.rename(cwd, moved);
+  assert.equal(
+    (await store.discoveryPaths(moved))[0],
+    path.join(moved, ".pi", "skills", candidate.name, "SKILL.md"),
+  );
+  assert.equal((await store.get(local.id, moved)).projectRoot, moved);
 });
-test("concurrent store instances do not lose candidates", async (t) => {
-  const { root, store } = await fixture(t);
+test("concurrent instances serialize metadata and published files", async (t) => {
+  const { cwd, agent, store } = await fixture(t);
   await Promise.all(
     Array.from({ length: 8 }, (_, i) =>
-      new SkillStore(root).consider(
+      new SkillStore(agent).consider(
         { ...candidate, name: `workflow-${i}` },
-        "/repo",
+        cwd,
       ),
     ),
   );
-  assert.equal((await store.list("/repo")).length, 8);
+  assert.equal((await store.list(cwd)).length, 8);
+  const skill = await ready(store, cwd);
+  const other = new SkillStore(agent);
+  await Promise.all([
+    store.draft(skill.id, cwd, {
+      ...document,
+      steps: ["First concurrent change."],
+    }),
+    other.validate(skill.id, cwd, validation, "s"),
+    store.draft(skill.id, cwd, {
+      ...document,
+      steps: ["Second concurrent change."],
+    }),
+    other.validate(skill.id, cwd, validation, "s"),
+  ]);
+  const final = await store.get(skill.id, cwd);
+  assert.equal(final.activeRevision, 3);
+  assert.match(
+    await fs.readFile(store.skillPath(final, cwd), "utf8"),
+    /Second concurrent change/,
+  );
 });
 test("stale or competing locks fail closed", async (t) => {
-  const { root, store } = await fixture(t);
-  await fs.mkdir(path.join(root, ".mutation-lock"), { recursive: true });
-  await assert.rejects(store.consider(candidate, "/repo"), /locked/);
+  const { cwd, store } = await fixture(t);
+  await fs.mkdir(path.join(store.scopeRoot(cwd, "global"), ".pi-skills-lock"), {
+    recursive: true,
+  });
+  await assert.rejects(store.consider(candidate, cwd), /locked/);
 });
-test("symlink store and catalog cannot redirect writes", async (t) => {
-  const { temp, root, store } = await fixture(t);
+test("symlink roots and metadata cannot redirect writes", async (t) => {
+  const { temp, agent, cwd, store } = await fixture(t);
   const outside = path.join(temp, "outside");
   await fs.mkdir(outside);
-  await fs.symlink(outside, root);
-  await assert.rejects(store.consider(candidate, "/repo"), /symlink/);
-  await fs.unlink(root);
-  await fs.mkdir(root);
+  await fs.symlink(outside, agent);
+  await assert.rejects(store.consider(candidate, cwd), /symlink/);
+  await fs.unlink(agent);
+  const metadata = store.catalogPath(cwd, "project");
+  await fs.mkdir(path.dirname(metadata), { recursive: true });
   await fs.writeFile(path.join(outside, "file"), "preserve");
-  await fs.symlink(path.join(outside, "file"), store.catalogPath);
-  await assert.rejects(store.consider(candidate, "/repo"), /symlink/);
+  await fs.symlink(path.join(outside, "file"), metadata);
+  await assert.rejects(store.consider(candidate, cwd), /symlink/);
   assert.equal(
     await fs.readFile(path.join(outside, "file"), "utf8"),
     "preserve",
   );
 });
-test("activation rejects changed revisions and external name collisions", async (t) => {
-  const { store } = await fixture(t);
-  const skill = await ready(store);
-  await assert.rejects(
-    store.activate(skill.id, "/repo", reviewHash(skill), [candidate.name]),
-    /already uses/,
-  );
-  await store.draft(skill.id, "/repo", {
-    ...document,
-    steps: ["Revised after review."],
-  });
-  await assert.rejects(
-    store.activate(skill.id, "/repo", reviewHash(skill), []),
-    /changed since review/,
-  );
-});
-test("global/project active name collisions are rejected", async (t) => {
-  const { store } = await fixture(t);
-  const local = await ready(store);
-  await store.activate(local.id, "/repo", reviewHash(local), []);
-  const global = await store.consider(
-    { ...candidate, scope: "global" },
-    "/repo",
-  );
-  await store.draft(global.id, "/repo", document);
-  const checked = await store.validate(global.id, "/repo", validation, "s");
-  await assert.rejects(
-    store.activate(global.id, "/repo", reviewHash(checked), []),
-    /already uses/,
-  );
-});
-test("activation rejects evidence changed during user review", async (t) => {
-  const { store } = await fixture(t);
-  const skill = await ready(store);
-  await store.validate(
-    skill.id,
-    "/repo",
-    { ...validation, limitations: "Changed evidence after the review opened." },
-    "session-2",
-  );
-  await assert.rejects(
-    store.activate(skill.id, "/repo", reviewHash(skill), []),
-    /changed since review/,
-  );
-});
-test("deprecation invalidates old validation before reactivation", async (t) => {
-  const { store } = await fixture(t);
-  const skill = await ready(store);
-  await store.activate(skill.id, "/repo", reviewHash(skill), []);
-  await store.retire(
-    skill.id,
-    "/repo",
-    "deprecated",
-    "The toolchain is unsafe now.",
-  );
-  const deprecated = await store.get(skill.id, "/repo");
-  await assert.rejects(
-    store.activate(skill.id, "/repo", reviewHash(deprecated), []),
-    /validation/,
-  );
-});
-test("project root uses canonical repo root even from a nested directory", async (t) => {
-  const { temp } = await fixture(t);
-  await fs.mkdir(path.join(temp, ".git"));
-  await fs.mkdir(path.join(temp, "src", "nested"), { recursive: true });
+test("unmarked files and auxiliary files are never claimed or removed", async (t) => {
+  const { cwd, store } = await fixture(t);
+  const root = store.scopeRoot(cwd, "project");
+  await fs.mkdir(root, { recursive: true });
+  await fs.writeFile(path.join(root, `${candidate.name}.md`), "external skill");
+  await assert.rejects(store.consider(candidate, cwd), /unmanaged/);
   assert.equal(
-    await projectRoot(path.join(temp, "src", "nested")),
-    await fs.realpath(temp),
+    await fs.readFile(path.join(root, `${candidate.name}.md`), "utf8"),
+    "external skill",
   );
+  await fs.unlink(path.join(root, `${candidate.name}.md`));
+  const skill = await ready(store, cwd);
+  const file = store.skillPath(skill, cwd);
+  const auxiliary = path.join(path.dirname(file), "helper.sh");
+  await fs.writeFile(auxiliary, "preserve helper");
+  await store.retire(skill.id, cwd, "archived", "Superseded.");
+  assert.equal(await fs.readFile(auxiliary, "utf8"), "preserve helper");
+  await assert.rejects(fs.stat(file), { code: "ENOENT" });
+  assert.equal((await store.get(skill.id, cwd)).status, "archived");
+});
+test("hand edits and removed markers block all automated overwrite/delete paths", async (t) => {
+  const { cwd, store } = await fixture(t);
+  const skill = await ready(store, cwd);
+  const file = store.skillPath(skill, cwd);
+  const edited =
+    (await fs.readFile(file, "utf8")).replace(
+      / {2}pi-skills-generated:.*\n/,
+      "",
+    ) + "\nHand edited.\n";
+  await fs.writeFile(file, edited);
+  await assert.rejects(
+    store.draft(skill.id, cwd, document),
+    /manually modified/,
+  );
+  await assert.rejects(
+    store.validate(skill.id, cwd, validation, "s"),
+    /manually modified/,
+  );
+  await assert.rejects(
+    store.retire(skill.id, cwd, "deprecated", "Stale."),
+    /manually modified/,
+  );
+  assert.deepEqual(await store.discoveryPaths(cwd), []);
+  assert.equal(await fs.readFile(file, "utf8"), edited);
+});
+test("deprecation removes only the owned SKILL.md and retains verification history", async (t) => {
+  const { cwd, store } = await fixture(t);
+  const skill = await ready(store, cwd);
+  const retired = await store.retire(
+    skill.id,
+    cwd,
+    "deprecated",
+    "Toolchain changed.",
+  );
+  assert.equal(retired.activeRevision, null);
+  assert.deepEqual(
+    retired.revisions[0].validation,
+    skill.revisions[0].validation,
+  );
+  assert.ok(retired.revisions[0].invalidatedAt);
+  assert.deepEqual(await store.discoveryPaths(cwd), []);
+  assert.equal(
+    (await store.validate(skill.id, cwd, validation, "recheck")).status,
+    "active",
+  );
+});
+test("active and external name collisions prevent automatic publication", async (t) => {
+  const { cwd, store } = await fixture(t);
+  const local = await ready(store, cwd);
+  await assert.rejects(
+    store.validate(local.id, cwd, validation, "s", [candidate.name]),
+    /already uses/,
+  );
+  const global = await store.consider({ ...candidate, scope: "global" }, cwd);
+  await store.draft(global.id, cwd, document);
+  await assert.rejects(
+    store.validate(global.id, cwd, validation, "s"),
+    /already uses/,
+  );
+});
+test("ids cannot escape native skill roots", async (t) => {
+  const { cwd, store } = await fixture(t);
+  await assert.rejects(
+    store.draft("project:../../outside", cwd, document),
+    /Invalid skill id/,
+  );
+  await assert.rejects(
+    store.draft("project:name:extra", cwd, document),
+    /Invalid skill id/,
+  );
+});
+test("legacy v0.1 records migrate once without deleting source data", async (t) => {
+  const { agent, cwd, store } = await fixture(t);
+  const original = activate(
+    validate(
+      draft(consider(candidate, cwd), document),
+      validation,
+      "legacy-session",
+    ),
+  );
+  const { generation: _generation, ...legacySkill } = original;
+  const legacyFile = path.join(agent, "pi-skills", "catalog.json");
+  const legacyBytes = JSON.stringify({
+    version: 1,
+    skills: [{ ...legacySkill, id: `project-oldhash:${candidate.name}` }],
+  });
+  await fs.mkdir(path.dirname(legacyFile), { recursive: true });
+  await fs.writeFile(legacyFile, legacyBytes);
+  await Promise.all([store.migrateLegacy(cwd), store.migrateLegacy(cwd)]);
+  await store.migrateLegacy(cwd);
+  assert.equal((await store.list(cwd)).length, 1);
+  assert.equal(
+    (await store.discoveryPaths(cwd))[0],
+    path.join(cwd, ".pi", "skills", candidate.name, "SKILL.md"),
+  );
+  assert.equal(await fs.readFile(legacyFile, "utf8"), legacyBytes);
 });

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { scanContent } from "./content-scanner.ts";
@@ -75,8 +75,17 @@ export interface Revision {
     source: "model-report";
   };
 }
+export interface Adoption {
+  content: string;
+  relativePath: string;
+  sourceSha256: string;
+  at: string;
+  reason: string;
+}
 export interface Skill {
   id: string;
+  adoption?: Adoption;
+  generation: string;
   candidate: Candidate;
   projectRoot: string | null;
   status: Status;
@@ -94,30 +103,21 @@ export function assertSafe(value: unknown): void {
     }
     if (Array.isArray(item)) item.forEach(visit);
     else if (item && typeof item === "object")
-      Object.values(item).forEach(visit);
+      Object.entries(item).forEach(([key, entry]) => {
+        visit(key);
+        visit(entry);
+      });
   };
+  // JSON escaping flattens newlines and unrelated fields into synthetic commands.
   visit(value);
-  const error = scanContent(JSON.stringify(value));
-  if (error) throw new Error(error);
 }
 
 export function documentHash(document: SkillDocument): string {
   return createHash("sha256").update(JSON.stringify(document)).digest("hex");
 }
 
-export function reviewHash(skill: Skill): string {
-  return createHash("sha256").update(JSON.stringify(skill)).digest("hex");
-}
-
-export function skillId(
-  candidate: Pick<Candidate, "name" | "scope">,
-  projectRoot: string,
-): string {
-  const scope =
-    candidate.scope === "global"
-      ? "global"
-      : `project-${createHash("sha256").update(projectRoot).digest("hex")}`;
-  return `${scope}:${candidate.name}`;
+export function skillId(candidate: Pick<Candidate, "name" | "scope">): string {
+  return `${candidate.scope}:${candidate.name}`;
 }
 
 function event(skill: Skill, kind: string, reason: string): void {
@@ -129,7 +129,8 @@ export function consider(candidate: Candidate, projectRoot: string): Skill {
     throw new Error("Invalid candidate evidence.");
   assertSafe(candidate);
   return {
-    id: skillId(candidate, projectRoot),
+    id: skillId(candidate),
+    generation: randomUUID(),
     candidate,
     projectRoot: candidate.scope === "project" ? projectRoot : null,
     status: "candidate",
@@ -139,7 +140,7 @@ export function consider(candidate: Candidate, projectRoot: string): Skill {
       {
         at: new Date().toISOString(),
         kind: "consider",
-        reason: "Evidence recorded; not approved or discoverable.",
+        reason: "Evidence recorded; not yet validated or discoverable.",
       },
     ],
   };
@@ -159,7 +160,7 @@ export function draft(skill: Skill, document: SkillDocument): Skill {
     document,
     hash: documentHash(document),
   });
-  if (next.activeRevision === null) next.status = "draft";
+  if (next.status !== "active") next.status = "draft";
   event(
     next,
     "draft",
@@ -191,11 +192,11 @@ export function validate(
     sessionId,
     source: "model-report",
   };
-  if (next.activeRevision === null) next.status = "validated";
+  if (next.status !== "active") next.status = "validated";
   event(
     next,
     "validate",
-    "Model-reported evidence recorded, not independently executed or user-approved.",
+    "Model-reported evidence recorded, not independently executed.",
   );
   return next;
 }
@@ -219,7 +220,7 @@ export function activate(skill: Skill): Skill {
   event(
     next,
     "activate",
-    "User command approved this exact revision after reviewing evidence.",
+    "Automatically published this exact revision after passing validation and ownership checks.",
   );
   return next;
 }
@@ -232,7 +233,7 @@ export function retire(
   assertSafe(reason);
   if (skill.status === "archived")
     throw new Error("Skill is already archived.");
-  if (status === "archived" && skill.activeRevision !== null)
+  if (status === "archived" && skill.status === "active")
     throw new Error("Deprecate the active skill before archiving.");
   const next = structuredClone(skill);
   next.status = status;
@@ -243,9 +244,24 @@ export function retire(
   return next;
 }
 
+export function renderAdopted(skill: Skill): string | null {
+  if (!skill.adoption) return null;
+  return skill.adoption.content.replace(
+    /^---(\r?\n)/,
+    (_header, newline: string) =>
+      `---${newline}pi-skills-adopted: ${JSON.stringify(skill.generation)}${newline}`,
+  );
+}
+
+export function publishedContent(skill: Skill): string | null {
+  if (skill.status !== "active") return null;
+  if (skill.activeRevision === null) return renderAdopted(skill);
+  return renderSkill(skill, skill.revisions[skill.activeRevision - 1]);
+}
+
 export function renderSkill(skill: Skill, revision: Revision): string {
   const doc = revision.document;
   const list = (items: string[]) =>
     items.map((item, i) => `${i + 1}. ${item}`).join("\n");
-  return `---\nname: ${JSON.stringify(skill.candidate.name)}\ndescription: ${JSON.stringify(doc.description)}\nmetadata:\n  pi-skills-revision: ${JSON.stringify(String(revision.number))}\n---\n\n# ${skill.candidate.name}\n\n## When to use\n\n${doc.whenToUse}\n\n## Prerequisites\n\n${list(doc.prerequisites)}\n\n## Procedure\n\n${list(doc.steps)}\n\n## Pitfalls\n\n${list(doc.pitfalls)}\n\n## Verification\n\n${list(doc.verification)}\n\n## Approval boundaries\n\n${doc.approvalBoundaries}\n`;
+  return `---\nname: ${JSON.stringify(skill.candidate.name)}\ndescription: ${JSON.stringify(doc.description)}\nmetadata:\n  pi-skills-generated: ${JSON.stringify(skill.generation)}\n  pi-skills-revision: ${JSON.stringify(String(revision.number))}\n---\n\n# ${skill.candidate.name}\n\n## When to use\n\n${doc.whenToUse}\n\n## Prerequisites\n\n${list(doc.prerequisites)}\n\n## Procedure\n\n${list(doc.steps)}\n\n## Pitfalls\n\n${list(doc.pitfalls)}\n\n## Verification\n\n${list(doc.verification)}\n\n## Approval boundaries\n\n${doc.approvalBoundaries}\n`;
 }
